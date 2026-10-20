@@ -1,0 +1,223 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default deny all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && (request.auth.token.email_verified == true || request.auth.token.firebase.sign_in_provider == 'google.com');
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Admin authorization check:
+    // Bootstrapped user email or admin registry doc
+    function isAdmin() {
+      return isSignedIn() && (
+        request.auth.token.email == 's6710380123@pkru.ac.th' ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    // ==========================================
+    // USERS COLLECTION
+    // ==========================================
+    function isValidUser(data) {
+      return data.uid is string && data.uid.size() <= 128 &&
+             data.email is string && data.email.size() <= 150 &&
+             data.displayName is string && data.displayName.size() <= 100 &&
+             data.role in ['guest', 'member', 'moderator', 'admin'] &&
+             data.status in ['active', 'suspended'];
+    }
+
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId);
+      allow list: if isSignedIn();
+      
+      // Creating profile: regular users must start as 'member' and 'active'
+      allow create: if isSignedIn() && isValidId(userId) && isOwner(userId) &&
+        isValidUser(incoming()) && incoming().uid == request.auth.uid &&
+        (incoming().role == 'member' || isAdmin()) &&
+        (incoming().status == 'active' || isAdmin());
+
+      // Updating profile: admins can update everything, users can only update displayName, photoURL, bio
+      allow update: if isSignedIn() && isValidId(userId) && isValidUser(incoming()) && (
+        isAdmin() ||
+        (
+          isOwner(userId) &&
+          incoming().uid == existing().uid &&
+          incoming().email == existing().email &&
+          incoming().role == existing().role &&
+          incoming().status == existing().status &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'bio', 'updatedAt'])
+        )
+      );
+
+      allow delete: if isAdmin() && isValidId(userId);
+    }
+
+    // ==========================================
+    // RESOURCES COLLECTION
+    // ==========================================
+    function isValidResource(data) {
+      return data.title is string && data.title.size() >= 3 && data.title.size() <= 200 &&
+             data.description is string && data.description.size() >= 5 && data.description.size() <= 3000 &&
+             data.category is string && data.category.size() <= 100 &&
+             data.educationLevel is string && data.educationLevel.size() <= 100 &&
+             data.resourceType is string && data.resourceType.size() <= 50 &&
+             data.authorId is string && data.authorId.size() <= 128 &&
+             data.status in ['published', 'hidden'];
+    }
+
+    match /resources/{resourceId} {
+      // Anyone (even guest) can read published resources. Author or Admin can read hidden ones.
+      allow get: if isValidId(resourceId) && (
+        resource.data.status == 'published' ||
+        (isSignedIn() && (resource.data.authorId == request.auth.uid || isAdmin()))
+      );
+
+      allow list: if resource.data.status == 'published' ||
+                     (isSignedIn() && (resource.data.authorId == request.auth.uid || isAdmin()));
+
+      allow create: if isSignedIn() && isValidId(resourceId) &&
+        isValidResource(incoming()) &&
+        incoming().authorId == request.auth.uid &&
+        incoming().viewCount >= 0 &&
+        incoming().favoriteCount >= 0;
+
+      allow update: if isSignedIn() && isValidId(resourceId) && (
+        isAdmin() ||
+        // Action 1: Owner updating content
+        (
+          resource.data.authorId == request.auth.uid &&
+          isValidResource(incoming()) &&
+          incoming().authorId == existing().authorId &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'title', 'description', 'category', 'educationLevel', 'resourceType',
+            'url', 'fileUrl', 'thumbnailUrl', 'status', 'updatedAt'
+          ])
+        ) ||
+        // Action 2: Incremental view counter or favorite counter update by members
+        (
+          incoming().diff(existing()).affectedKeys().hasOnly(['viewCount', 'favoriteCount', 'updatedAt'])
+        )
+      );
+
+      allow delete: if isValidId(resourceId) && isSignedIn() && (
+        resource.data.authorId == request.auth.uid || isAdmin()
+      );
+    }
+
+    // ==========================================
+    // FAVORITES COLLECTION
+    // ==========================================
+    function isValidFavorite(data) {
+      return data.userId is string && data.userId.size() <= 128 &&
+             data.resourceId is string && data.resourceId.size() <= 128 &&
+             data.resourceTitle is string && data.resourceTitle.size() <= 200;
+    }
+
+    match /favorites/{favoriteId} {
+      allow get: if isSignedIn() && isValidId(favoriteId) && (
+        resource.data.userId == request.auth.uid || isAdmin()
+      );
+
+      allow list: if isSignedIn() && (
+        resource.data.userId == request.auth.uid || isAdmin()
+      );
+
+      allow create: if isSignedIn() && isValidId(favoriteId) &&
+        isValidFavorite(incoming()) &&
+        incoming().userId == request.auth.uid;
+
+      allow delete: if isSignedIn() && isValidId(favoriteId) && (
+        resource.data.userId == request.auth.uid || isAdmin()
+      );
+
+      // Favorites cannot be updated, only created or deleted
+      allow update: if false;
+    }
+
+    // ==========================================
+    // REPORTS COLLECTION
+    // ==========================================
+    function isValidReport(data) {
+      return data.resourceId is string && data.resourceId.size() <= 128 &&
+             data.reportedByUid is string && data.reportedByUid.size() <= 128 &&
+             data.reason is string && data.reason.size() <= 100 &&
+             data.status in ['pending', 'resolved', 'dismissed'];
+    }
+
+    match /reports/{reportId} {
+      allow get: if isSignedIn() && isValidId(reportId) && (
+        isAdmin() || resource.data.reportedByUid == request.auth.uid
+      );
+
+      // Only admins/moderators can list reports
+      allow list: if isAdmin();
+
+      // Any signed in member can report content
+      allow create: if isSignedIn() && isValidId(reportId) &&
+        isValidReport(incoming()) &&
+        incoming().reportedByUid == request.auth.uid &&
+        incoming().status == 'pending';
+
+      // Only admins can update reports (resolve/dismiss)
+      allow update: if isAdmin() && isValidId(reportId) && isValidReport(incoming());
+
+      allow delete: if isAdmin() && isValidId(reportId);
+    }
+
+    // ==========================================
+    // MODERATION LOGS COLLECTION
+    // ==========================================
+    match /moderationLogs/{logId} {
+      allow get, list: if isAdmin() && isValidId(logId);
+      allow create: if isAdmin() && isValidId(logId) && incoming().performedByUid == request.auth.uid;
+      // Logs are immutable
+      allow update, delete: if false;
+    }
+
+    // ==========================================
+    // SETTINGS COLLECTION
+    // ==========================================
+    match /settings/{settingId} {
+      // Public read for site configuration (taxonomies, announcement, site name)
+      allow get: if isValidId(settingId);
+      allow list: if true;
+      // Only admin can write site settings
+      allow create, update: if isAdmin() && isValidId(settingId);
+      allow delete: if false;
+    }
+
+    // ==========================================
+    // ADMINS WHITELIST COLLECTION
+    // ==========================================
+    match /admins/{adminUid} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+  }
+}
